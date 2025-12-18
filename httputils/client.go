@@ -1,66 +1,85 @@
 package httputils
 
 import (
+	"bs/constant"
 	"bytes"
-	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"sync"
 	"time"
 )
 
+// HttpCli 接口保持不变（注意：Put 建议大写为 PUT，跨包可调用）
 type HttpCli interface {
-	GET(ctx context.Context, urlStr string, params map[string]string, headers map[string]string) (*http.Response, error)
-	POST(ctx context.Context, url string, body interface{}, headers map[string]string) (*http.Response, error)
-	DELETE(ctx context.Context, urlStr string, params map[string]string, headers map[string]string) (*http.Response, error)
+	GET(urlStr string, params map[string]string) (*http.Response, error)
+	POST(url string, body interface{}) (*http.Response, error)
+	DELETE(urlStr string, params map[string]string) (*http.Response, error)
+	Put(url string, body interface{}) (*http.Response, error)
+	SetHeader(headers map[string]string) // 设置当前实例的 Header（仅作用于自身）
 }
 
-var httpClient = &Client{}
-
-const (
-	TIMEOUT = time.Second * 120
+// 核心：单例化 http.Transport（连接池，并发安全）
+var (
+	singletonTransport *http.Transport
+	once               sync.Once // 保证 Transport 仅初始化一次
 )
 
+// 初始化单例 Transport（仅执行一次）
+func initSingletonTransport() {
+	once.Do(func() {
+		singletonTransport = &http.Transport{} // 全局唯一连接池，并发安全
+	})
+}
+
+const (
+	DefaultTimeout = time.Second * 120 // 常量名规范化
+)
+
+// Client 结构体：每个实例独立持有 Header 和超时，复用单例 Transport
 type Client struct {
-	cli     *http.Client
-	timeout time.Duration // 默认超时时间
-	proxy   string
+	cli     *http.Client  // 每个实例独立，但复用单例 Transport
+	header  http.Header   // 每个实例独立的 Header，无并发写冲突
+	timeout time.Duration // 每个实例独立的超时，避免全局污染
 }
 
-// NewHTTPClient 创建 HTTP 客户端实例
-func NewHTTPClient(timeout time.Duration, proxy string) error {
-	transport := &http.Transport{}
-	// 配置代理（如果传入了代理地址）
-	if proxy != "" {
-		proxyURL, err := url.Parse(proxy)
-		if err == nil {
-			transport.Proxy = http.ProxyURL(proxyURL)
-		} else {
-			fmt.Printf("警告：代理配置无效，将忽略代理：%v\n", err)
-			return err
-		}
-	}
-	if timeout == 0 {
-		timeout = TIMEOUT
-	}
-	httpClient = &Client{
+// DefaultHTTPClient 创建默认 Client（复用单例 Transport，Header 独立）
+func DefaultHTTPClient() HttpCli {
+	initSingletonTransport()
+	return &Client{
 		cli: &http.Client{
-			Transport: transport,
-			Timeout:   timeout,
+			Transport: singletonTransport, // 复用单例连接池
 		},
-		timeout: timeout,
-		proxy:   proxy,
+		header: make(http.Header), // 初始化独立 Header，避免空指针
 	}
-	return nil
 }
 
-// 通用请求方法（内部使用，封装重复逻辑）
-func (c *Client) doRequest(ctx context.Context, method, url string, headers map[string]string, body interface{}) (*http.Response, error) {
-	var reqBody io.Reader
+// NewHTTPClient 创建自定义 Client（复用单例 Transport，Header 独立）
+func NewHTTPClient(timeout time.Duration, proxy *url.URL) (HttpCli, error) {
+	initSingletonTransport()
+	// 仅在首次初始化时配置代理（Transport 单例，避免重复修改）
+	if proxy != nil && proxy.Scheme != "" && singletonTransport.Proxy == nil {
+		singletonTransport.Proxy = http.ProxyURL(proxy)
+	}
+	// 处理超时（0 则用默认值）
+	if timeout <= constant.Zero {
+		timeout = DefaultTimeout
+	}
+	// 每个 New 都创建新 Client 实例，Header 独立
+	return &Client{
+		cli: &http.Client{
+			Transport: singletonTransport, // 复用单例连接池
+			Timeout:   timeout,            // 当前实例独立超时
+		},
+		header: make(http.Header), // 独立 Header，无锁安全
+	}, nil
+}
 
-	// 处理请求体（支持 JSON 序列化）
+// doRequest 通用请求方法（无锁，Header 仅操作当前实例）
+func (c *Client) doRequest(method, url string, body interface{}) (*http.Response, error) {
+	var reqBody io.Reader
 	if body != nil {
 		jsonBody, err := json.Marshal(body)
 		if err != nil {
@@ -69,69 +88,96 @@ func (c *Client) doRequest(ctx context.Context, method, url string, headers map[
 		reqBody = bytes.NewBuffer(jsonBody)
 	}
 
-	// 创建 HTTP 请求
-	req, err := http.NewRequestWithContext(ctx, method, url, reqBody)
+	// 创建请求
+	req, err := http.NewRequest(method, url, reqBody)
 	if err != nil {
 		return nil, fmt.Errorf("创建请求失败：%v", err)
 	}
 
-	// 设置默认请求头（JSON 格式）
-	req.Header.Set("Content-Type", "application/json;charset=utf-8")
-	// 覆盖/添加自定义请求头
-	for k, v := range headers {
-		req.Header.Set(k, v)
+	// 复制当前实例的 Header 到请求（仅读当前实例，无并发冲突）
+	// 克隆 Header 避免请求修改影响实例本身
+	req.Header = c.header.Clone()
+
+	// 默认 Content-Type（仅当前请求生效，不影响实例 Header）
+	if req.Header.Get("Content-Type") == "" {
+		req.Header.Set("Content-Type", "application/json;charset=utf-8")
 	}
 
-	// 发送请求
+	// 发送请求（移除 defer resp.Body.Close()，调用方负责读取后关闭）
 	resp, err := c.cli.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("发送请求失败：%v", err)
 	}
-	defer resp.Body.Close() // 确保响应体关闭
+
 	return resp, nil
 }
 
-// GET 请求：支持 URL 参数、自定义请求头
-func (c *Client) GET(ctx context.Context, urlStr string, params map[string]string, headers map[string]string) (*http.Response, error) {
-	// 拼接 URL 参数
+// SetHeader 设置当前实例的 Header（仅作用于自身，无锁安全）
+func (c *Client) SetHeader(headers map[string]string) {
+	// 仅修改当前实例的 Header，无并发写同一个资源，无需锁
+	for key, value := range headers {
+		c.header.Set(key, value)
+	}
+}
+
+// GET 请求：修复 URL 参数拼接逻辑（更健壮）
+func (c *Client) GET(urlStr string, params map[string]string) (*http.Response, error) {
 	if params != nil && len(params) > 0 {
 		values := url.Values{}
 		for k, v := range params {
 			values.Add(k, v)
 		}
-		if urlQuery := values.Encode(); urlQuery != "" {
-			urlStr += "?" + urlQuery
+		query := values.Encode()
+		if query != "" {
+			// 处理原有 URL 已带 query 的情况
+			if url.QueryEscape(urlStr) != urlStr {
+				urlStr += "&" + query
+			} else {
+				urlStr += "?" + query
+			}
 		}
 	}
-	// 发送 GET 请求（无请求体）
-	return c.doRequest(ctx, http.MethodGet, urlStr, headers, nil)
+	return c.doRequest(http.MethodGet, urlStr, nil)
 }
 
-// POST 请求：支持 JSON 请求体、自定义请求头
-// url: 请求地址
-// body: 请求体（可序列化的结构体/Map）
-// headers: 自定义请求头（可选，传 nil 用默认）
-// respObj: 响应数据反序列化的目标对象（如 &Result{}）
-func (c *Client) POST(ctx context.Context, url string, body interface{}, headers map[string]string) (*http.Response, error) {
-	return c.doRequest(ctx, http.MethodPost, url, headers, body)
+// POST 请求：复用 doRequest
+func (c *Client) POST(url string, body interface{}) (*http.Response, error) {
+	return c.doRequest(http.MethodPost, url, body)
 }
 
-// Put 请求：用法同 Post
-func (c *Client) Put(ctx context.Context, url string, body interface{}, headers map[string]string) (*http.Response, error) {
-	return c.doRequest(ctx, http.MethodPut, url, headers, body)
+// Put 请求：保持原有命名（建议改为 PUT 规范）
+func (c *Client) Put(url string, body interface{}) (*http.Response, error) {
+	return c.doRequest(http.MethodPut, url, body)
 }
 
-// DELETE 请求：支持 URL 参数、自定义请求头
-func (c *Client) DELETE(ctx context.Context, urlStr string, params map[string]string, headers map[string]string) (*http.Response, error) {
-	// 拼接 URL 参数
+// DELETE 请求：同 GET 优化参数拼接
+func (c *Client) DELETE(urlStr string, params map[string]string) (*http.Response, error) {
 	if params != nil && len(params) > 0 {
 		values := url.Values{}
 		for k, v := range params {
 			values.Add(k, v)
 		}
-		if urlQuery := values.Encode(); urlQuery != "" {
-			urlStr += "?" + urlQuery
+		query := values.Encode()
+		if query != "" {
+			if url.QueryEscape(urlStr) != urlStr {
+				urlStr += "&" + query
+			} else {
+				urlStr += "?" + query
+			}
 		}
 	}
-	return c.doRequest(ctx, http.MethodDelete, urlStr, headers, nil)
+	return c.doRequest(http.MethodDelete, urlStr, nil)
+}
+
+// 辅助函数：安全读取响应体（调用方必须使用，避免资源泄漏）
+func ReadResponseBody(resp *http.Response) ([]byte, error) {
+	if resp == nil {
+		return nil, fmt.Errorf("响应体为空")
+	}
+	defer resp.Body.Close() // 读取后关闭，避免连接泄漏
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("读取响应体失败：%v", err)
+	}
+	return body, nil
 }
