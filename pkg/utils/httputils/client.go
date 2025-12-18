@@ -12,13 +12,14 @@ import (
 	"time"
 )
 
-// HttpCli 接口保持不变（注意：Put 建议大写为 PUT，跨包可调用）
-type HttpCli interface {
-	GET(urlStr string, params map[string]string) (*http.Response, error)
+// Cli 接口保持不变（注意：Put 建议大写为 PUT，跨包可调用）
+type Cli interface {
+	GET(urlStr string) (*http.Response, error)
 	POST(url string, body interface{}) (*http.Response, error)
 	DELETE(urlStr string, params map[string]string) (*http.Response, error)
 	Put(url string, body interface{}) (*http.Response, error)
 	SetHeader(headers map[string]string) // 设置当前实例的 Header（仅作用于自身）
+	ReadResponseBody(resp *http.Response) ([]byte, error)
 }
 
 // 核心：单例化 http.Transport（连接池，并发安全）
@@ -46,7 +47,7 @@ type Client struct {
 }
 
 // DefaultHTTPClient 创建默认 Client（复用单例 Transport，Header 独立）
-func DefaultHTTPClient() HttpCli {
+func DefaultHTTPClient() Cli {
 	initSingletonTransport()
 	return &Client{
 		cli: &http.Client{
@@ -57,7 +58,7 @@ func DefaultHTTPClient() HttpCli {
 }
 
 // NewHTTPClient 创建自定义 Client（复用单例 Transport，Header 独立）
-func NewHTTPClient(timeout time.Duration, proxy *url.URL) (HttpCli, error) {
+func NewHTTPClient(timeout time.Duration, proxy *url.URL) (Cli, error) {
 	initSingletonTransport()
 	// 仅在首次初始化时配置代理（Transport 单例，避免重复修改）
 	if proxy != nil && proxy.Scheme != "" && singletonTransport.Proxy == nil {
@@ -121,22 +122,7 @@ func (c *Client) SetHeader(headers map[string]string) {
 }
 
 // GET 请求：修复 URL 参数拼接逻辑（更健壮）
-func (c *Client) GET(urlStr string, params map[string]string) (*http.Response, error) {
-	if params != nil && len(params) > 0 {
-		values := url.Values{}
-		for k, v := range params {
-			values.Add(k, v)
-		}
-		query := values.Encode()
-		if query != "" {
-			// 处理原有 URL 已带 query 的情况
-			if url.QueryEscape(urlStr) != urlStr {
-				urlStr += "&" + query
-			} else {
-				urlStr += "?" + query
-			}
-		}
-	}
+func (c *Client) GET(urlStr string) (*http.Response, error) {
 	return c.doRequest(http.MethodGet, urlStr, nil)
 }
 
@@ -169,8 +155,8 @@ func (c *Client) DELETE(urlStr string, params map[string]string) (*http.Response
 	return c.doRequest(http.MethodDelete, urlStr, nil)
 }
 
-// 辅助函数：安全读取响应体（调用方必须使用，避免资源泄漏）
-func ReadResponseBody(resp *http.Response) ([]byte, error) {
+// ReadResponseBody 辅助函数：安全读取响应体（调用方必须使用，避免资源泄漏）
+func (c *Client) ReadResponseBody(resp *http.Response) ([]byte, error) {
 	if resp == nil {
 		return nil, fmt.Errorf("响应体为空")
 	}
